@@ -97,6 +97,7 @@ let lastCpuInfo: { idle: number; total: number }[] | null = null;
 
 // AI manager — runs OpenCode and Codex simultaneously, routes by backend
 let aiManager: AiManager | null = null;
+let aiManagerInitPromise: Promise<void> | null = null;
 // Proxy tunnel management
 let currentSessionCode: string | null = null;
 let currentSessionPassword: string | null = null;
@@ -3333,6 +3334,38 @@ function gracefulShutdown(): void {
   process.exit(0);
 }
 
+function startAiManagerInBackground(): void {
+  if (aiManager || aiManagerInitPromise) return;
+
+  aiManagerInitPromise = (async () => {
+    try {
+      const manager = await createAiManager();
+      if (shuttingDown) {
+        await manager.destroy();
+        return;
+      }
+
+      aiManager = manager;
+      aiManager.subscribe((backend, event) => {
+        emitAppEvent({
+          v: 1,
+          id: `evt-${Date.now()}`,
+          ns: "ai",
+          action: "event",
+          payload: { ...event, backend },
+        });
+      });
+    } catch (error) {
+      if (DEBUG_MODE) {
+        const message = error instanceof Error ? error.message : String(error);
+        console.error(`[ai] background init failed: ${message}`);
+      }
+    } finally {
+      aiManagerInitPromise = null;
+    }
+  })();
+}
+
 async function connectWebSocketV2(): Promise<void> {
   const gatewayUrl = currentPrimaryGateway;
   if (!currentSessionPassword) {
@@ -3463,19 +3496,9 @@ async function main(): Promise<void> {
       debugLog(`PTY runtime unsupported on ${os.platform()}/${os.arch()}. Skipping prefetch.\n`);
     }
 
-    // Start both AI backends (OpenCode + Codex). Unavailable ones are skipped.
-    aiManager = await createAiManager();
-
-    // Wire provider events → mobile app data channel, tagged with backend name.
-    aiManager.subscribe((backend, event) => {
-      emitAppEvent({
-        v: 1,
-        id: `evt-${Date.now()}`,
-        ns: "ai",
-        action: "event",
-        payload: { ...event, backend },
-      });
-    });
+    // Start AI backends in the background so missing or slow AI runtimes never
+    // block QR/session startup for the rest of the CLI.
+    startAiManagerInBackground();
 
     let sessionCodeToUse: string | null = null;
     let sessionPasswordToUse: string;
